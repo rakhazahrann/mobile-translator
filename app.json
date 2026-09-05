@@ -1,0 +1,65 @@
+{
+  "expo": {
+    "name": "mobile-translator",
+    "slug": "mobile-translator",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "light",
+    "ios": {
+      "supportsTablet": true,
+      "infoPlist": {
+        "NSSpeechRecognitionUsageDescription": "Allow Mobile Translator to use speech recognition",
+        "NSMicrophoneUsageDescription": "Allow Mobile Translator to access microphone for speech recognition"
+      }
+    },
+    "android": {
+      "adaptiveIcon": {
+        "backgroundColor": "#E6F4FE",
+        "foregroundImage": "./assets/android-icon-foreground.png",
+        "backgroundImage": "./assets/android-icon-background.png",
+        "monochromeImage": "./assets/android-icon-monochrome.png"
+      },
+      "predictiveBackGestureEnabled": false,
+      "permissions": [
+        "android.permission.CAMERA",
+        "android.permission.RECORD_AUDIO"
+      ],
+      "package": "com.anonymous.mobiletranslator"
+    },
+    "web": {
+      "favicon": "./assets/favicon.png"
+    },
+    "scheme": "mobile-translator",
+    "plugins": [
+      "expo-router",
+      "expo-status-bar",
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "Allow Mobile Translator to access camera for text scanning"
+        }
+      ],
+      [
+        "expo-speech-recognition",
+        {
+          "microphonePermission": "Allow Mobile Translator to access microphone for speech recognition",
+          "speechRecognitionPermission": "Allow Mobile Translator to use speech recognition"
+        }
+      ],
+      [
+        "rn-mlkit-ocr",
+        {
+          "ocrModels": [
+            "latin",
+            "chinese",
+            "japanese",
+            "korean",
+            "devanagari"
+          ],
+          "ocrUseBundled": true
+        }
+      ]
+    ]
+  }
+}
