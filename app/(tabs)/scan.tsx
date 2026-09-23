@@ -2,15 +2,15 @@ import React, { useState, useCallback, useRef, useEffect } from "react";
 import {
   View,
   Text,
+  Image,
   TouchableOpacity,
   StyleSheet,
   ActivityIndicator,
-  ScrollView,
   Platform,
 } from "react-native";
 import { CameraView, useCameraPermissions } from "expo-camera";
 import * as Speech from "expo-speech";
-import MlkitOcr, { DetectorType } from "rn-mlkit-ocr";
+import MlkitOcr, { DetectorType, OcrResult } from "rn-mlkit-ocr";
 import LanguagePicker from "../../src/components/LanguagePicker";
 import { Language } from "../../src/types";
 import { LANGUAGES } from "../../src/constants/languages";
@@ -27,18 +27,43 @@ const DETECTOR_ORDER: DetectorType[] = [
   "devanagari",
 ];
 
-function extractOcrText(
-  ocrResult: unknown
-): string {
-  if (typeof ocrResult === "string") return ocrResult;
-  const obj = ocrResult as { text?: string; blocks?: { text: string }[] };
-  if (obj?.text) return obj.text;
-  if (Array.isArray((ocrResult as { blocks?: unknown }).blocks)) {
-    return (ocrResult as { blocks: { text: string }[] }).blocks
-      .map((b) => b.text)
-      .join("\n");
-  }
-  return "";
+type OverlayLine = {
+  translated: string;
+  frame: { x: number; y: number; width: number; height: number };
+};
+
+function pickBestOcr(results: OcrResult[]): OcrResult | null {
+  return results.reduce<OcrResult | null>((best, cur) => {
+    const curLen = cur?.text?.trim().length ?? 0;
+    const bestLen = best?.text?.trim().length ?? 0;
+    return curLen > bestLen ? cur : best;
+  }, null);
+}
+
+function unionFrame(frames: OverlayLine["frame"][]) {
+  const minX = Math.min(...frames.map((f) => f.x));
+  const minY = Math.min(...frames.map((f) => f.y));
+  const maxX = Math.max(...frames.map((f) => f.x + f.width));
+  const maxY = Math.max(...frames.map((f) => f.y + f.height));
+  return { x: minX, y: minY, width: maxX - minX, height: maxY - minY };
+}
+
+function mapFrame(
+  frame: OverlayLine["frame"],
+  imgW: number,
+  imgH: number,
+  viewW: number,
+  viewH: number
+) {
+  const scale = Math.min(viewW / imgW, viewH / imgH);
+  const offsetX = (viewW - imgW * scale) / 2;
+  const offsetY = (viewH - imgH * scale) / 2;
+  return {
+    left: offsetX + frame.x * scale,
+    top: offsetY + frame.y * scale,
+    width: frame.width * scale,
+    height: frame.height * scale,
+  };
 }
 
 export default function ScanScreen() {
@@ -46,14 +71,17 @@ export default function ScanScreen() {
   const [cameraReady, setCameraReady] = useState(false);
   const [targetLang, setTargetLang] = useState<Language>(LANGUAGES[0]);
   const [detectedLang, setDetectedLang] = useState<Language | null>(null);
-  const [scannedText, setScannedText] = useState("");
-  const [translatedText, setTranslatedText] = useState("");
   const [error, setError] = useState("");
   const [availableDetectors, setAvailableDetectors] = useState<DetectorType[]>(
     []
   );
   const [autoScan, setAutoScan] = useState(true);
   const [busy, setBusy] = useState(false);
+  const [frozenUri, setFrozenUri] = useState<string | null>(null);
+  const [imageSize, setImageSize] = useState({ width: 0, height: 0 });
+  const [viewSize, setViewSize] = useState({ width: 0, height: 0 });
+  const [overlays, setOverlays] = useState<OverlayLine[]>([]);
+  const [fullTranslation, setFullTranslation] = useState("");
   const cameraRef = useRef<CameraView>(null);
   const busyRef = useRef(false);
   const lastTextRef = useRef("");
@@ -73,52 +101,58 @@ export default function ScanScreen() {
   }, []);
 
   const runOcr = useCallback(
-    async (uri: string): Promise<string> => {
+    async (uri: string): Promise<OcrResult | null> => {
       const detectors =
         availableDetectors.length > 0 ? availableDetectors : DETECTOR_ORDER;
       const results = await Promise.all(
         detectors.map(async (detector) => {
           try {
-            const res = await MlkitOcr.recognizeText(uri, detector);
-            return extractOcrText(res);
+            return await MlkitOcr.recognizeText(uri, detector);
           } catch {
-            return "";
+            return { text: "", blocks: [] } as OcrResult;
           }
         })
       );
-      return results.reduce((best, current) =>
-        current.length > best.length ? current : best
-      );
+      return pickBestOcr(results);
     },
     [availableDetectors]
   );
 
+  const unfreeze = useCallback(() => {
+    setFrozenUri(null);
+    setOverlays([]);
+    setFullTranslation("");
+    lastTextRef.current = "";
+  }, []);
+
   const handleScan = useCallback(async () => {
-    if (busyRef.current || !cameraRef.current) return;
+    if (busyRef.current || !cameraRef.current || frozenUri) return;
     busyRef.current = true;
     setBusy(true);
     setError("");
 
     try {
-      const photo = await cameraRef.current.takePictureAsync({ quality: 1 });
+      const photo = await cameraRef.current.takePictureAsync({ quality: 0.7 });
       if (!photo?.uri) {
         return;
       }
 
-      const text = await runOcr(photo.uri);
-      if (!text.trim()) {
+      const ocr = await runOcr(photo.uri);
+      const text = ocr?.text?.trim() ?? "";
+      if (!text) {
         return;
       }
 
-      const normalized = text.trim();
-      if (normalized === lastTextRef.current) {
+      if (text === lastTextRef.current) {
         return;
       }
-      lastTextRef.current = normalized;
-      setScannedText(normalized);
+      lastTextRef.current = text;
+
+      const lines =
+        ocr?.blocks.flatMap((b) => b.lines).filter((l) => l.text.trim()) ?? [];
 
       const res = await translateText({
-        text: normalized,
+        text: lines.map((l) => l.text).join("\n") || text,
         sourceLanguage: "auto",
         targetLanguage: targetLang.code,
       });
@@ -131,10 +165,30 @@ export default function ScanScreen() {
         : null;
       setDetectedLang(detected);
 
-      setTranslatedText(res.translatedText);
+      const parts = res.translatedText.split("\n");
+      const mapped: OverlayLine[] =
+        lines.length === 0
+          ? []
+          : parts.length === lines.length
+            ? lines.map((line, i) => ({
+                translated: parts[i] ?? line.text,
+                frame: line.frame,
+              }))
+            : [
+                {
+                  translated: res.translatedText,
+                  frame: unionFrame(lines.map((l) => l.frame)),
+                },
+              ];
+
+      setOverlays(mapped);
+      setFullTranslation(res.translatedText);
+      setImageSize({ width: photo.width, height: photo.height });
+      setFrozenUri(photo.uri);
+
       await addHistory({
         id: Date.now().toString(),
-        sourceText: normalized,
+        sourceText: text,
         translatedText: res.translatedText,
         sourceLanguage: detected?.code ?? "auto",
         targetLanguage: targetLang.code,
@@ -146,13 +200,13 @@ export default function ScanScreen() {
       busyRef.current = false;
       setBusy(false);
     }
-  }, [runOcr, targetLang]);
+  }, [runOcr, targetLang, frozenUri]);
 
   useEffect(() => {
-    if (!autoScan || !cameraReady) return;
+    if (!autoScan || !cameraReady || frozenUri) return;
     const interval = setInterval(handleScan, SCAN_INTERVAL_MS);
     return () => clearInterval(interval);
-  }, [autoScan, cameraReady, handleScan]);
+  }, [autoScan, cameraReady, handleScan, frozenUri]);
 
   if (!permission) {
     return (
@@ -173,6 +227,13 @@ export default function ScanScreen() {
     );
   }
 
+  const canMap =
+    frozenUri &&
+    imageSize.width > 0 &&
+    imageSize.height > 0 &&
+    viewSize.width > 0 &&
+    viewSize.height > 0;
+
   return (
     <View style={styles.container}>
       <View style={styles.langRow}>
@@ -188,76 +249,110 @@ export default function ScanScreen() {
         <LanguagePicker selected={targetLang} onSelect={setTargetLang} />
       </View>
 
-      <View style={styles.cameraContainer}>
-        <CameraView
-          ref={cameraRef}
-          style={styles.camera}
-          facing="back"
-          autofocus="on"
-          onCameraReady={() => setCameraReady(true)}
-        >
-          <View style={styles.overlay}>
-            <View style={styles.scanFrame} />
-            {busy ? (
-              <View style={styles.scanningBadge}>
-                <ActivityIndicator size="small" color="#fff" />
-                <Text style={styles.scanningText}>Scanning...</Text>
-              </View>
-            ) : null}
-          </View>
-        </CameraView>
-      </View>
-
-      <View style={styles.controlRow}>
-        <TouchableOpacity
-          style={[styles.scanToggle, autoScan && styles.scanToggleOn]}
-          onPress={() => setAutoScan((v) => !v)}
-        >
-          <Text style={styles.scanToggleText}>
-            {autoScan ? "Auto-Scan On" : "Auto-Scan Off"}
-          </Text>
-        </TouchableOpacity>
-        <TouchableOpacity
-          style={[styles.scanButton, busy && styles.scanButtonDisabled]}
-          onPress={handleScan}
-          disabled={busy}
-        >
-          <Text style={styles.scanButtonText}>Scan Now</Text>
-        </TouchableOpacity>
-      </View>
-
-      <ScrollView
-        style={styles.resultArea}
-        contentContainerStyle={styles.resultContent}
+      <View
+        style={styles.cameraContainer}
+        onLayout={(e) => {
+          const { width, height } = e.nativeEvent.layout;
+          setViewSize({ width, height });
+        }}
       >
+        {frozenUri ? (
+          <View style={styles.frozenWrap}>
+            <Image
+              source={{ uri: frozenUri }}
+              style={styles.frozenImage}
+              resizeMode="contain"
+            />
+            {canMap
+              ? overlays.map((item, i) => {
+                  const box = mapFrame(
+                    item.frame,
+                    imageSize.width,
+                    imageSize.height,
+                    viewSize.width,
+                    viewSize.height
+                  );
+                  if (box.width < 8 || box.height < 8) return null;
+                  return (
+                    <View key={i} style={[styles.overlayBox, box]}>
+                      <Text
+                        numberOfLines={2}
+                        adjustsFontSizeToFit
+                        style={[
+                          styles.overlayText,
+                          { fontSize: Math.max(10, box.height * 0.72) },
+                        ]}
+                      >
+                        {item.translated}
+                      </Text>
+                    </View>
+                  );
+                })
+              : null}
+          </View>
+        ) : (
+          <CameraView
+            ref={cameraRef}
+            style={styles.camera}
+            facing="back"
+            autofocus="on"
+            onCameraReady={() => setCameraReady(true)}
+          >
+            <View style={styles.overlay}>
+              <View style={styles.scanFrame} />
+              {busy ? (
+                <View style={styles.scanningBadge}>
+                  <ActivityIndicator size="small" color="#fff" />
+                  <Text style={styles.scanningText}>Scanning...</Text>
+                </View>
+              ) : null}
+            </View>
+          </CameraView>
+        )}
+
         {error ? (
-          <View style={styles.errorCard}>
+          <View style={styles.errorBadge}>
             <Text style={styles.errorText}>{error}</Text>
           </View>
         ) : null}
+      </View>
 
-        {scannedText ? (
-          <View style={styles.card}>
-            <Text style={styles.cardLabel}>Detected Text</Text>
-            <Text style={styles.cardText}>{scannedText}</Text>
-          </View>
-        ) : null}
-
-        {translatedText ? (
-          <View style={styles.card}>
-            <Text style={styles.cardLabel}>Translation</Text>
-            <Text style={styles.translatedCardText}>{translatedText}</Text>
-            <TouchableOpacity
-              onPress={() =>
-                Speech.speak(translatedText, { language: targetLang.code })
-              }
-              style={styles.speakRow}
-            >
-              <Text style={styles.speakIcon}>🔊</Text>
+      <View style={styles.controlRow}>
+        {frozenUri ? (
+          <>
+            <TouchableOpacity style={styles.scanToggle} onPress={unfreeze}>
+              <Text style={styles.scanToggleText}>Scan Again</Text>
             </TouchableOpacity>
-          </View>
-        ) : null}
-      </ScrollView>
+            <TouchableOpacity
+              style={styles.scanButton}
+              onPress={() =>
+                Speech.speak(fullTranslation, { language: targetLang.code })
+              }
+              disabled={!fullTranslation}
+            >
+              <Text style={styles.scanButtonText}>Speak</Text>
+            </TouchableOpacity>
+          </>
+        ) : (
+          <>
+            <TouchableOpacity
+              style={[styles.scanToggle, autoScan && styles.scanToggleOn]}
+              onPress={() => setAutoScan((v) => !v)}
+            >
+              <Text style={styles.scanToggleText}>
+                {autoScan ? "Auto-Scan On" : "Auto-Scan Off"}
+              </Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={[styles.scanButton, busy && styles.scanButtonDisabled]}
+              onPress={handleScan}
+              disabled={busy}
+            >
+              <Text style={styles.scanButtonText}>Scan Now</Text>
+            </TouchableOpacity>
+          </>
+        )}
+      </View>
     </View>
   );
 }
@@ -328,13 +423,32 @@ const styles = StyleSheet.create({
     marginLeft: 4,
   },
   cameraContainer: {
-    height: 280,
+    flex: 1,
     margin: 12,
     borderRadius: 12,
     overflow: "hidden",
+    backgroundColor: "#000",
   },
   camera: {
     flex: 1,
+  },
+  frozenWrap: {
+    flex: 1,
+  },
+  frozenImage: {
+    ...StyleSheet.absoluteFill,
+  },
+  overlayBox: {
+    position: "absolute",
+    backgroundColor: "rgba(255,255,255,0.92)",
+    borderRadius: 4,
+    justifyContent: "center",
+    paddingHorizontal: 2,
+  },
+  overlayText: {
+    color: "#111",
+    fontWeight: "700",
+    textAlign: "center",
   },
   overlay: {
     flex: 1,
@@ -365,10 +479,24 @@ const styles = StyleSheet.create({
     fontSize: 13,
     fontWeight: "600",
   },
+  errorBadge: {
+    position: "absolute",
+    left: 12,
+    right: 12,
+    bottom: 12,
+    backgroundColor: "rgba(255,240,240,0.95)",
+    borderRadius: 8,
+    padding: 10,
+  },
+  errorText: {
+    color: "#FF3B30",
+    fontSize: 14,
+  },
   controlRow: {
     flexDirection: "row",
     gap: 10,
     marginHorizontal: 12,
+    marginBottom: Platform.OS === "ios" ? 12 : 12,
   },
   scanToggle: {
     flex: 1,
@@ -399,59 +527,5 @@ const styles = StyleSheet.create({
     color: "#fff",
     fontSize: 15,
     fontWeight: "700",
-  },
-  resultArea: {
-    flex: 1,
-    marginTop: 8,
-  },
-  resultContent: {
-    padding: 12,
-    paddingBottom: Platform.OS === "ios" ? 40 : 20,
-  },
-  errorCard: {
-    backgroundColor: "#FFF0F0",
-    borderRadius: 12,
-    padding: 12,
-    marginBottom: 8,
-  },
-  errorText: {
-    color: "#FF3B30",
-    fontSize: 14,
-  },
-  card: {
-    backgroundColor: "#fff",
-    borderRadius: 12,
-    padding: 14,
-    marginBottom: 8,
-    shadowColor: "#000",
-    shadowOffset: { width: 0, height: 1 },
-    shadowOpacity: 0.06,
-    shadowRadius: 3,
-    elevation: 1,
-  },
-  cardLabel: {
-    fontSize: 11,
-    color: "#666",
-    fontWeight: "600",
-    textTransform: "uppercase",
-    marginBottom: 6,
-  },
-  cardText: {
-    fontSize: 15,
-    color: "#333",
-    lineHeight: 22,
-  },
-  translatedCardText: {
-    fontSize: 15,
-    color: "#007AFF",
-    fontWeight: "500",
-    lineHeight: 22,
-  },
-  speakRow: {
-    marginTop: 8,
-    alignSelf: "flex-start",
-  },
-  speakIcon: {
-    fontSize: 20,
   },
 });
